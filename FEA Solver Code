@@ -1,0 +1,491 @@
+# FEA Solver Integration & Heat Map Visualization for Exercise Machine
+# Supports multiple FEA solvers with VTK output for stress/strain analysis
+!pip install pyvista
+import pyvista as pv
+import numpy as np
+import matplotlib.pyplot as plt
+from IPython.display import display
+import os
+
+# Configure PyVista for Colab
+pv.set_jupyter_backend('static')
+pv.global_theme.window_size = [1024, 768]
+pv.global_theme.anti_aliasing = 'ssaa'
+
+class FEAResultsAnalyzer:
+    """
+    Comprehensive FEA results analyzer with heat map visualization
+    Supports results from ANSYS, Abaqus, SolidWorks, FEniCS, and other VTK-compatible solvers
+    """
+
+    def __init__(self, results_file_path):
+        """
+        Initialize with FEA results file
+        """
+        self.results_file = results_file_path
+        self.mesh = None
+        self.load_results()
+
+    def load_results(self):
+        """
+        Load FEA results from various file formats
+        """
+        print(f"�� Loading FEA results: {self.results_file}")
+
+        try:
+            # PyVista can read many formats: .vtk, .vtu, .exo, .e, .dat, etc.
+            self.mesh = pv.read(self.results_file)
+            print(f"✅ Results loaded successfully!")
+            print(f"   - Points: {self.mesh.n_points}")
+            print(f"   - Cells: {self.mesh.n_cells}")
+            print(f"   - Available arrays: {self.mesh.array_names}")
+
+            # Check for common FEA result arrays
+            self._identify_result_types()
+
+        except Exception as e:
+            print(f"❌ Error loading results: {e}")
+            return None
+
+    def _identify_result_types(self):
+        """
+        Identify what types of results are available
+        """
+        arrays = self.mesh.array_names
+        self.available_results = {}
+
+        # Common naming conventions from different solvers
+        stress_names = ['von_mises_stress', 'vonmises', 'stress_vm', 'S_Mises',
+                       'Stress', 'STRESS', 'von_mises', 'equivalent_stress']
+        displacement_names = ['displacement', 'DISPLACEMENT', 'U', 'disp',
+                            'total_displacement', 'displacement_magnitude']
+        strain_names = ['strain', 'STRAIN', 'equivalent_strain', 'EPEQ', 'strain_eq']
+        safety_names = ['safety_factor', 'SF', 'factor_of_safety', 'FOS']
+
+        for array in arrays:
+            array_lower = array.lower()
+
+            if any(stress in array_lower for stress in [s.lower() for s in stress_names]):
+                self.available_results['stress'] = array
+            elif any(disp in array_lower for disp in [d.lower() for d in displacement_names]):
+                self.available_results['displacement'] = array
+            elif any(strain in array_lower for strain in [s.lower() for s in strain_names]):
+                self.available_results['strain'] = array
+            elif any(sf in array_lower for sf in [s.lower() for s in safety_names]):
+                self.available_results['safety_factor'] = array
+
+        print(f"�� Identified results: {list(self.available_results.keys())}")
+
+    def create_stress_heatmap(self, stress_type='auto', view_angle='iso',
+                            colormap='jet', show_edges=False):
+        """
+        Create von Mises stress heat map
+        """
+        if 'stress' not in self.available_results and stress_type == 'auto':
+            print("❌ No stress data found in results")
+            return None
+
+        stress_array = stress_type if stress_type != 'auto' else self.available_results['stress']
+
+        if stress_array not in self.mesh.array_names:
+            print(f"❌ Stress array '{stress_array}' not found")
+            return None
+
+        print(f"�� Creating stress heat map using '{stress_array}'")
+
+        # Create plotter
+        plotter = pv.Plotter(off_screen=True, window_size=(1000, 800))
+
+        # Add mesh with stress coloring
+        plotter.add_mesh(self.mesh,
+                        scalars=stress_array,
+                        show_edges=show_edges,
+                        cmap=colormap,
+                        opacity=0.9)
+
+        # Add scalar bar
+        plotter.add_scalar_bar(title=f"{stress_array.replace('_', ' ').title()} (Pa)",
+                              height=0.6, width=0.05, position_x=0.9)
+
+        plotter.add_axes()
+        plotter.camera_position = view_angle
+
+        # Get screenshot
+        img = plotter.screenshot(return_img=True)
+        plotter.close()
+
+        # Display
+        plt.figure(figsize=(14, 10))
+        plt.imshow(img)
+        plt.axis('off')
+        plt.title(f'Stress Analysis Heat Map - {stress_array.replace("_", " ").title()}',
+                 fontsize=16, pad=20)
+        plt.tight_layout()
+        plt.show()
+
+        # Statistics
+        stress_data = self.mesh[stress_array]
+        self._print_statistics(stress_data, "Stress", "Pa")
+
+        return img
+
+    def create_displacement_heatmap(self, displacement_type='auto',
+                                  scale_factor=1.0, view_angle='iso'):
+        """
+        Create displacement magnitude heat map with deformed shape
+        """
+        if 'displacement' not in self.available_results and displacement_type == 'auto':
+            print("❌ No displacement data found in results")
+            return None
+
+        disp_array = displacement_type if displacement_type != 'auto' else self.available_results['displacement']
+
+        if disp_array not in self.mesh.array_names:
+            print(f"❌ Displacement array '{disp_array}' not found")
+            return None
+
+        print(f"�� Creating displacement heat map using '{disp_array}'")
+
+        # Create deformed mesh
+        if len(self.mesh[disp_array].shape) == 2 and self.mesh[disp_array].shape[1] == 3:
+            # Vector displacement data
+            deformed_mesh = self.mesh.warp_by_vector(vectors=disp_array, factor=scale_factor)
+            disp_mag = np.linalg.norm(self.mesh[disp_array], axis=1)
+            deformed_mesh[f"{disp_array}_magnitude"] = disp_mag
+            scalar_name = f"{disp_array}_magnitude"
+        else:
+            # Scalar displacement magnitude
+            deformed_mesh = self.mesh.copy()
+            scalar_name = disp_array
+
+        # Create plotter
+        plotter = pv.Plotter(off_screen=True, window_size=(1000, 800))
+
+        # Add original mesh (transparent)
+        plotter.add_mesh(self.mesh, style='wireframe', color='gray',
+                        opacity=0.3, line_width=0.5, label='Original')
+
+        # Add deformed mesh with displacement coloring
+        plotter.add_mesh(deformed_mesh,
+                        scalars=scalar_name,
+                        cmap='plasma',
+                        opacity=0.9,
+                        label='Deformed')
+
+        plotter.add_scalar_bar(title=f"Displacement (m)\nScale: {scale_factor}x",
+                              height=0.6, width=0.05, position_x=0.9)
+
+        plotter.add_axes()
+        plotter.camera_position = view_angle
+
+        # Get screenshot
+        img = plotter.screenshot(return_img=True)
+        plotter.close()
+
+        # Display
+        plt.figure(figsize=(14, 10))
+        plt.imshow(img)
+        plt.axis('off')
+        plt.title(f'Displacement Analysis Heat Map (Scale: {scale_factor}x)',
+                 fontsize=16, pad=20)
+        plt.tight_layout()
+        plt.show()
+
+        # Statistics
+        if len(self.mesh[disp_array].shape) == 2:
+            disp_data = np.linalg.norm(self.mesh[disp_array], axis=1)
+        else:
+            disp_data = self.mesh[disp_array]
+        self._print_statistics(disp_data, "Displacement", "m")
+
+        return img
+
+    def create_safety_factor_heatmap(self, yield_strength=250e6, view_angle='iso'):
+        """
+        Create safety factor heat map
+        """
+        if 'stress' not in self.available_results:
+            print("❌ No stress data found for safety factor calculation")
+            return None
+
+        stress_array = self.available_results['stress']
+        stress_data = self.mesh[stress_array]
+
+        # Calculate safety factor
+        safety_factor = yield_strength / np.maximum(stress_data, 1e-6)  # Avoid division by zero
+        safety_factor = np.clip(safety_factor, 0, 10)  # Cap at 10 for visualization
+
+        # Add to mesh
+        mesh_copy = self.mesh.copy()
+        mesh_copy['Safety_Factor'] = safety_factor
+
+        print(f"�� Creating safety factor heat map (Yield: {yield_strength/1e6:.1f} MPa)")
+
+        # Create plotter
+        plotter = pv.Plotter(off_screen=True, window_size=(1000, 800))
+
+        # Add mesh with safety factor coloring
+        plotter.add_mesh(mesh_copy,
+                        scalars='Safety_Factor',
+                        cmap='RdYlGn',  # Red (dangerous) to Green (safe)
+                        clim=[1, 5],   # Focus on critical range
+                        opacity=0.9)
+
+        plotter.add_scalar_bar(title="Safety Factor\n(>2.0 recommended)",
+                              height=0.6, width=0.05, position_x=0.9)
+
+        plotter.add_axes()
+        plotter.camera_position = view_angle
+
+        # Get screenshot
+        img = plotter.screenshot(return_img=True)
+        plotter.close()
+
+        # Display
+        plt.figure(figsize=(14, 10))
+        plt.imshow(img)
+        plt.axis('off')
+        plt.title(f'Safety Factor Analysis (Yield Strength: {yield_strength/1e6:.1f} MPa)',
+                 fontsize=16, pad=20)
+        plt.tight_layout()
+        plt.show()
+
+        # Critical areas analysis
+        critical_areas = np.sum(safety_factor < 2.0)
+        total_elements = len(safety_factor)
+
+        print(f"�� Safety Analysis:")
+        print(f"   - Critical elements (SF < 2.0): {critical_areas}/{total_elements} ({critical_areas/total_elements*100:.1f}%)")
+        print(f"   - Minimum safety factor: {np.min(safety_factor):.2f}")
+        print(f"   - Average safety factor: {np.mean(safety_factor):.2f}")
+
+        return img
+
+    def create_comprehensive_analysis(self, yield_strength=250e6):
+        """
+        Create comprehensive analysis with multiple heat maps
+        """
+        print("�� Creating comprehensive FEA analysis...")
+
+        results = {}
+
+        # 1. Stress analysis
+        if 'stress' in self.available_results:
+            print("\n1️⃣ Von Mises Stress Analysis")
+            results['stress'] = self.create_stress_heatmap()
+
+        # 2. Displacement analysis
+        if 'displacement' in self.available_results:
+            print("\n2️⃣ Displacement Analysis")
+            results['displacement'] = self.create_displacement_heatmap(scale_factor=100)
+
+        # 3. Safety factor
+        if 'stress' in self.available_results:
+            print("\n3️⃣ Safety Factor Analysis")
+            results['safety'] = self.create_safety_factor_heatmap(yield_strength)
+
+        # 4. Multiple viewing angles for stress
+        if 'stress' in self.available_results:
+            print("\n4️⃣ Multiple Viewing Angles")
+            self.create_multi_angle_stress_analysis()
+
+        return results
+
+    def create_multi_angle_stress_analysis(self):
+        """
+        Create stress analysis from multiple angles
+        """
+        stress_array = self.available_results['stress']
+
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+        angles = [
+            ('Front View', 'xy'),
+            ('Side View', 'yz'),
+            ('Top View', 'xz'),
+            ('Isometric', 'iso')
+        ]
+
+        for i, (name, view) in enumerate(angles):
+            row, col = i // 2, i % 2
+
+            plotter = pv.Plotter(off_screen=True, window_size=(600, 600))
+            plotter.add_mesh(self.mesh, scalars=stress_array, cmap='jet', opacity=0.9)
+            plotter.camera_position = view
+
+            img = plotter.screenshot(return_img=True)
+            plotter.close()
+
+            axes[row, col].imshow(img)
+            axes[row, col].set_title(f'{name}', fontsize=12)
+            axes[row, col].axis('off')
+
+        plt.suptitle('Stress Analysis - Multiple Views', fontsize=16)
+        plt.tight_layout()
+        plt.show()
+
+    def _print_statistics(self, data, data_type, units):
+        """
+        Print statistical summary of results
+        """
+        print(f"\n�� {data_type} Statistics:")
+        print(f"   - Maximum: {np.max(data):.2e} {units}")
+        print(f"   - Minimum: {np.min(data):.2e} {units}")
+        print(f"   - Average: {np.mean(data):.2e} {units}")
+        print(f"   - Std Dev: {np.std(data):.2e} {units}")
+
+# ============================================================================
+# SOLVER-SPECIFIC INTEGRATION GUIDES
+# ============================================================================
+
+def integrate_ansys_results():
+    """
+    Guide for integrating ANSYS Mechanical results
+    """
+    guide = """
+    �� ANSYS Mechanical Integration:
+
+    1. In ANSYS Mechanical:
+       - Right-click on 'Solution' → Insert → Export
+       - Choose 'VTK Files' format
+       - Select results to export:
+         ✓ Equivalent Stress (von Mises)
+         ✓ Total Deformation
+         ✓ Safety Factor (if calculated)
+
+    2. Export settings:
+       - Format: VTK
+       - Export path: Choose your Colab directory
+       - Include: Mesh and all selected results
+
+    3. Use with this code:
+       analyzer = FEAResultsAnalyzer('ansys_results.vtk')
+       analyzer.create_comprehensive_analysis()
+    """
+    print(guide)
+
+def integrate_solidworks_results():
+    """
+    Guide for integrating SolidWorks Simulation results
+    """
+    guide = """
+    �� SolidWorks Simulation Integration:
+
+    1. In SolidWorks Simulation:
+       - Right-click Study → Export Results
+       - Choose VTK format
+       - Select results:
+         ✓ von Mises Stress
+         ✓ Displacement
+         ✓ Factor of Safety
+
+    2. Alternative method:
+       - Use SolidWorks API or macro to export VTK
+       - Third-party tools like SimLab can convert
+
+    3. Use with this code:
+       analyzer = FEAResultsAnalyzer('solidworks_results.vtk')
+       analyzer.create_stress_heatmap()
+    """
+    print(guide)
+
+def integrate_abaqus_results():
+    """
+    Guide for integrating Abaqus results
+    """
+    guide = """
+    �� Abaqus Integration:
+
+    1. Using Abaqus CAE:
+       - File → Export → Model...
+       - Format: VTK
+       - Include results from ODB file
+
+    2. Using Python script in Abaqus:
+       ```python
+       # Abaqus script to export VTK
+       from abaqus import *
+       from abaqusConstants import *
+
+       odb = openOdb('your_results.odb')
+       session.writeVtkFile('output.vtk', odb=odb)
+       ```
+
+    3. Use with this code:
+       analyzer = FEAResultsAnalyzer('abaqus_results.vtk')
+       analyzer.create_comprehensive_analysis()
+    """
+    print(guide)
+
+def integrate_fenics_results():
+    """
+    Guide for integrating FEniCS results
+    """
+    guide = """
+    �� FEniCS Integration:
+
+    1. In your FEniCS simulation:
+       ```python
+       import pyvista as pv
+       from dolfinx.io import VTKFile
+
+       # After solving
+       with VTKFile(mesh.comm, "results.pvd", "w") as vtk:
+           vtk.write_mesh(mesh)
+           vtk.write_function(stress, 0)
+           vtk.write_function(displacement, 0)
+       ```
+
+    2. Convert to single VTK:
+       - ParaView can convert PVD series to single VTK
+       - Or use PyVista to read PVD directly
+
+    3. Use with this code:
+       analyzer = FEAResultsAnalyzer('results000000.vtu')
+       analyzer.create_comprehensive_analysis()
+    """
+    print(guide)
+
+# ============================================================================
+# USAGE EXAMPLES
+# ============================================================================
+
+print("�� FEA Results Analyzer for Exercise Machine")
+print("="*60)
+print("Supported FEA Solvers:")
+print("✓ ANSYS Mechanical")
+print("✓ SolidWorks Simulation")
+print("✓ Abaqus/CAE")
+print("✓ FEniCS/FEniCSx")
+print("✓ Any solver with VTK export")
+print("="*60)
+
+# Show integration guides
+print("\n�� Integration Guides:")
+print("Run these functions for solver-specific instructions:")
+print("- integrate_ansys_results()")
+print("- integrate_solidworks_results()")
+print("- integrate_abaqus_results()")
+print("- integrate_fenics_results()")
+
+print("\n�� Quick Start:")
+print("1. Export your FEA results to VTK format")
+print("2. Upload to Colab")
+print("3. Run: analyzer = FEAResultsAnalyzer('your_results.vtk')")
+print("4. Run: analyzer.create_comprehensive_analysis()")
+
+# Example usage (uncomment when you have results file):
+"""
+# Load and analyze your exercise machine FEA results
+analyzer = FEAResultsAnalyzer('/content/exercise_machine_results.vtk')
+
+# Create comprehensive analysis with all heat maps
+results = analyzer.create_comprehensive_analysis(yield_strength=275e6)  # Steel yield strength
+
+# Or create individual analyses:
+# analyzer.create_stress_heatmap(colormap='jet')
+# analyzer.create_displacement_heatmap(scale_factor=50)
+# analyzer.create_safety_factor_heatmap(yield_strength=275e6)
+"""
+
+analyzer = FEAResultsAnalyzer('/content/workout_equipment_mesh.vtk')
