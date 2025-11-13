@@ -1,0 +1,75 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Parameters from the document context
+g = 9.81  # gravity m/s^2
+m_body = 70.0  # kg, example user body mass
+h_target = 0.6  # m, target pull-up height from simulations
+
+# Simulation parameters
+N = 100  # number of particles (users)
+T = 10.0  # total time in seconds (e.g., a training set)
+dt = 0.01  # time step
+steps = int(T / dt)
+
+# Model parameters (tuned for illustration; adjust based on calibration)
+beta_vel = 0.1  # velocity mimicry strength
+alpha_fixed = 500.0  # base force control in N
+alpha_social = 0.05  # social contagion strength for force
+gamma_f = 0.1  # fatigue rate
+lambda_mc = 0.01  # counterweight adjustment rate
+phi_mean = 0.0  # simplified shared wear term
+
+# Diffusion coefficients (noise levels)
+sigma_v = 0.1
+sigma_F = 10.0
+sigma_mc = 1.0
+
+# Initial conditions: [x, v, F_u, m_c] for each particle
+X = np.zeros((N, 4))
+X[:, 0] = 0.0  # initial position
+X[:, 1] = 0.0  # initial velocity
+X[:, 2] = 400.0 + np.random.normal(0, 50, N)  # initial user force ~ to overcome weight
+X[:, 3] = 20.0 + np.random.normal(0, 2, N)  # initial counterweight ~20 kg
+
+# Sigmas array for diffusion (no noise on position)
+sigmas = np.array([0.0, sigma_v, sigma_F, sigma_mc])
+
+# Storage for trajectories (averages)
+mean_traj = np.zeros((steps + 1, 4))
+mean_traj[0] = np.mean(X, axis=0)
+
+# Drift function
+def drift(X, mean_X):
+    mu = np.zeros_like(X)
+    mu[:, 0] = X[:, 1]  # dx = v dt
+    mu[:, 1] = (X[:, 2] + g * (X[:, 3] - m_body) + beta_vel * (mean_X[1] - X[:, 1])) / m_body  # dv
+    mu[:, 2] = alpha_fixed + alpha_social * (mean_X[2] - X[:, 2]) - gamma_f * X[:, 2]  # dF_u
+    mu[:, 3] = -lambda_mc * (X[:, 3] - mean_X[3]) + phi_mean  # dm_c, simplified
+    return mu
+
+# Simulation loop (Euler-Maruyama for McKean-Vlasov approximation via particles)
+for t in range(1, steps + 1):
+    mean_X = np.mean(X, axis=0)
+    mu = drift(X, mean_X)
+    dW = np.random.normal(0, np.sqrt(dt), (N, 4)) * sigmas
+    X += mu * dt + dW
+    # Optional bounds (e.g., position between 0 and h_target, counterweight >0)
+    X[:, 0] = np.clip(X[:, 0], 0, h_target)
+    X[:, 3] = np.maximum(X[:, 3], 0)
+    mean_traj[t] = np.mean(X, axis=0)
+
+# Time array
+time = np.linspace(0, T, steps + 1)
+
+# Plot mean trajectories
+labels = ['Position x (m)', 'Velocity v (m/s)', 'User Force F_u (N)', 'Counterweight m_c (kg)']
+fig, axs = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
+for i in range(4):
+    axs[i].plot(time, mean_traj[:, i])
+    axs[i].set_ylabel(labels[i])
+    axs[i].grid(True)
+axs[3].set_xlabel('Time (s)')
+plt.suptitle('Mean-Field Dynamics: Average over {} Users'.format(N))
+plt.tight_layout()
+plt.show()
