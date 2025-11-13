@@ -1,0 +1,351 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+from dataclasses import dataclass
+from typing import Tuple, List
+import seaborn as sns
+
+# Set style for better plots
+plt.style.use('seaborn-v0_8')
+sns.set_palette("husl")
+
+@dataclass
+class SDEParameters:
+    """Container for all SDE model parameters"""
+    # Physical parameters
+    m_b: float = 70.0          # User body mass (kg)
+    g: float = 9.81            # Gravitational acceleration (m/s²)
+    b: float = 5.0             # Damping coefficient (N⋅s/m)
+    
+    # Force generation parameters
+    gamma_f: float = 0.5       # Force decay rate (1/s)
+    alpha_f: float = 2.0       # Force generation rate coefficient (1/s)
+    beta_f: float = 0.1        # Velocity-dependent force modulation (N⋅s/m)
+    F_max: float = 800.0       # Maximum user force capacity (N)
+    
+    # Counterweight parameters
+    lambda_c: float = 1.0      # Counterweight restoration rate (1/s)
+    m_c_nominal: float = 30.0  # Nominal counterweight mass (kg)
+    m_c_max: float = 80.0      # Maximum counterweight mass (kg)
+    
+    # Noise parameters
+    sigma_v0: float = 0.1      # Baseline velocity noise (m/s)
+    epsilon_v: float = 0.3     # Phase-dependent noise modulation
+    omega_m: float = 1.0       # Movement frequency (rad/s)
+    phi: float = 0.0           # Phase offset
+    
+    sigma_f0: float = 10.0     # Baseline force noise (N)
+    eta_f: float = 20.0        # Initial force variability (N)
+    tau_f: float = 2.0         # Force stabilization time constant (s)
+    
+    sigma_c: float = 0.5       # Counterweight fluctuation intensity (kg)
+    
+    # Boundary conditions
+    x_min: float = 0.0         # Minimum position (m)
+    x_max: float = 0.6         # Maximum position (m) - typical pull-up range
+    x_bottom: float = 0.05     # Bottom position (m)
+    x_top: float = 0.55        # Top position (m)
+    
+    # Exercise phase parameters
+    F_concentric: float = 600.0   # Concentric phase target force (N)
+    F_eccentric: float = 300.0    # Eccentric phase target force (N)
+    kappa_c: float = 50.0         # Concentric force-velocity coefficient
+    kappa_e: float = 30.0         # Eccentric force-velocity coefficient
+
+class AssistedPullupSDE:
+    """Stochastic Differential Equation model for assisted pull-up machine"""
+    
+    def __init__(self, params: SDEParameters):
+        self.params = params
+        
+    def smooth_step(self, x: float, x_threshold: float, width: float = 0.05) -> float:
+        """Smooth step function for phase transitions"""
+        return 0.5 * (1 + np.tanh((x - x_threshold) / width))
+    
+    def target_force(self, x: float, x_dot: float, t: float) -> float:
+        """Calculate target force based on movement phase"""
+        # Determine if we're in concentric (upward) or eccentric (downward) phase
+        upward_phase = self.smooth_step(x, self.params.x_bottom)
+        downward_phase = 1 - self.smooth_step(x, self.params.x_top)
+        
+        F_target = (self.params.F_concentric * upward_phase * (x_dot >= 0) + 
+                   self.params.F_eccentric * downward_phase * (x_dot < 0))
+        
+        return F_target
+    
+    def velocity_noise_intensity(self, t: float) -> float:
+        """Phase-dependent velocity noise intensity"""
+        return self.params.sigma_v0 * np.sqrt(
+            1 + self.params.epsilon_v * np.cos(self.params.omega_m * t + self.params.phi)**2
+        )
+    
+    def force_noise_intensity(self, F_u: float, t: float) -> float:
+        """State-dependent force noise intensity"""
+        force_ratio = max(0, F_u) / self.params.F_max
+        fatigue_factor = self.params.eta_f * np.exp(-t / self.params.tau_f)
+        return self.params.sigma_f0 * np.sqrt(force_ratio + fatigue_factor)
+    
+    def drift_vector(self, X: np.ndarray, t: float) -> np.ndarray:
+        """Compute drift vector μ(X(t), t)"""
+        x, x_dot, F_u, m_c = X
+        
+        # Target force based on movement phase
+        F_target = self.target_force(x, x_dot, t)
+        
+        # Force-velocity relationship
+        beta_term = -self.params.beta_f * x_dot
+        
+        # Drift components
+        drift = np.array([
+            x_dot,  # dx/dt = ẋ
+            (F_u + m_c * self.params.g - self.params.m_b * self.params.g - 
+             self.params.b * x_dot) / self.params.m_b,  # dẋ/dt
+            (-self.params.gamma_f * F_u + self.params.alpha_f * F_target + beta_term),  # dF_u/dt
+            -self.params.lambda_c * (m_c - self.params.m_c_nominal)  # dm_c/dt
+        ])
+        
+        return drift
+    
+    def diffusion_matrix(self, X: np.ndarray, t: float) -> np.ndarray:
+        """Compute diffusion matrix σ(X(t), t)"""
+        x, x_dot, F_u, m_c = X
+        
+        sigma = np.array([
+            [0, 0, 0],
+            [self.velocity_noise_intensity(t), 0, 0],
+            [0, self.force_noise_intensity(F_u, t), 0],
+            [0, 0, self.params.sigma_c]
+        ])
+        
+        return sigma
+    
+    def apply_boundaries(self, X: np.ndarray) -> np.ndarray:
+        """Apply reflecting boundary conditions"""
+        x, x_dot, F_u, m_c = X
+        
+        # Position boundaries with reflecting conditions
+        if x <= self.params.x_min:
+            x = self.params.x_min
+            x_dot = max(0, x_dot)  # Only allow upward movement at bottom
+        elif x >= self.params.x_max:
+            x = self.params.x_max
+            x_dot = min(0, x_dot)  # Only allow downward movement at top
+        
+        # Force must be non-negative
+        F_u = max(0, F_u)
+        
+        # Counterweight mass boundaries
+        m_c = np.clip(m_c, 0, self.params.m_c_max)
+        
+        return np.array([x, x_dot, F_u, m_c])
+    
+    def euler_maruyama_step(self, X: np.ndarray, t: float, dt: float, 
+                           dW: np.ndarray) -> np.ndarray:
+        """Single Euler-Maruyama integration step"""
+        drift = self.drift_vector(X, t)
+        diffusion = self.diffusion_matrix(X, t)
+        
+        # Euler-Maruyama update
+        X_new = X + drift * dt + np.dot(diffusion, dW * np.sqrt(dt))
+        
+        # Apply boundary conditions
+        X_new = self.apply_boundaries(X_new)
+        
+        return X_new
+    
+    def milstein_step(self, X: np.ndarray, t: float, dt: float, 
+                     dW: np.ndarray) -> np.ndarray:
+        """Single Milstein scheme integration step (simplified)"""
+        drift = self.drift_vector(X, t)
+        diffusion = self.diffusion_matrix(X, t)
+        
+        # Euler-Maruyama term
+        euler_term = drift * dt + np.dot(diffusion, dW * np.sqrt(dt))
+        
+        # Simplified Milstein correction (diagonal approximation)
+        milstein_correction = 0.5 * np.diag(diffusion @ diffusion.T) * (dW**2 * dt - dt).sum()
+        
+        X_new = X + euler_term + milstein_correction
+        X_new = self.apply_boundaries(X_new)
+        
+        return X_new
+    
+    def simulate_trajectory(self, X0: np.ndarray, T: float, dt: float, 
+                          method: str = 'euler') -> Tuple[np.ndarray, np.ndarray]:
+        """Simulate a single stochastic trajectory"""
+        n_steps = int(T / dt)
+        t_array = np.linspace(0, T, n_steps + 1)
+        X_trajectory = np.zeros((n_steps + 1, 4))
+        X_trajectory[0] = X0
+        
+        for i in range(n_steps):
+            # Generate Wiener increments
+            dW = np.random.normal(0, 1, 3)
+            
+            if method == 'euler':
+                X_trajectory[i + 1] = self.euler_maruyama_step(
+                    X_trajectory[i], t_array[i], dt, dW
+                )
+            elif method == 'milstein':
+                X_trajectory[i + 1] = self.milstein_step(
+                    X_trajectory[i], t_array[i], dt, dW
+                )
+            else:
+                raise ValueError("Method must be 'euler' or 'milstein'")
+        
+        return t_array, X_trajectory
+    
+    def monte_carlo_simulation(self, X0: np.ndarray, T: float, dt: float, 
+                             n_trajectories: int = 100, 
+                             method: str = 'euler') -> Tuple[np.ndarray, List[np.ndarray]]:
+        """Run Monte Carlo simulation with multiple trajectories"""
+        trajectories = []
+        
+        for i in range(n_trajectories):
+            t_array, X_traj = self.simulate_trajectory(X0, T, dt, method)
+            trajectories.append(X_traj)
+            
+            if (i + 1) % 10 == 0:
+                print(f"Completed {i + 1}/{n_trajectories} trajectories")
+        
+        return t_array, trajectories
+    
+    def success_probability(self, trajectories: List[np.ndarray]) -> float:
+        """Calculate probability of successful pull-up completion"""
+        successful = 0
+        for traj in trajectories:
+            # Check if user reached the top position
+            if np.any(traj[:, 0] >= self.params.x_top * 0.95):  # 95% of top position
+                successful += 1
+        
+        return successful / len(trajectories)
+
+def create_visualizations(sde_model: AssistedPullupSDE, t_array: np.ndarray, 
+                         trajectories: List[np.ndarray]):
+    """Create comprehensive visualizations of the SDE simulation results"""
+    
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    fig.suptitle('Stochastic Assisted Pull-up Machine Dynamics', fontsize=16, fontweight='bold')
+    
+    # Convert trajectories to numpy array for easier manipulation
+    traj_array = np.array(trajectories)
+    n_traj, n_time, n_states = traj_array.shape
+    
+    state_labels = ['Position (m)', 'Velocity (m/s)', 'User Force (N)', 'Counterweight Mass (kg)']
+    state_colors = ['blue', 'red', 'green', 'purple']
+    
+    # Plot individual state variables
+    for i in range(4):
+        row = i // 2
+        col = i % 2 if i < 2 else (i % 2) + 1
+        ax = axes[row, col]
+        
+        # Plot sample trajectories
+        for j in range(min(10, n_traj)):
+            ax.plot(t_array, traj_array[j, :, i], alpha=0.3, color=state_colors[i], linewidth=0.8)
+        
+        # Plot mean and confidence bands
+        mean_traj = np.mean(traj_array[:, :, i], axis=0)
+        std_traj = np.std(traj_array[:, :, i], axis=0)
+        
+        ax.plot(t_array, mean_traj, color='black', linewidth=2, label='Mean')
+        ax.fill_between(t_array, mean_traj - 2*std_traj, mean_traj + 2*std_traj, 
+                       alpha=0.2, color=state_colors[i], label='95% CI')
+        
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel(state_labels[i])
+        ax.set_title(f'{state_labels[i]} Evolution')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    
+    # Phase portrait (Position vs Velocity)
+    ax_phase = axes[1, 0]
+    for j in range(min(20, n_traj)):
+        ax_phase.plot(traj_array[j, :, 0], traj_array[j, :, 1], 
+                     alpha=0.4, linewidth=0.8)
+    
+    ax_phase.set_xlabel('Position (m)')
+    ax_phase.set_ylabel('Velocity (m/s)')
+    ax_phase.set_title('Phase Portrait (Position vs Velocity)')
+    ax_phase.grid(True, alpha=0.3)
+    
+    # Success rate analysis
+    ax_success = axes[0, 2]
+    positions = traj_array[:, :, 0]
+    max_positions = np.max(positions, axis=1)
+    
+    ax_success.hist(max_positions, bins=30, alpha=0.7, density=True, 
+                   color='skyblue', edgecolor='black')
+    ax_success.axvline(sde_model.params.x_top, color='red', linestyle='--', 
+                      linewidth=2, label=f'Target ({sde_model.params.x_top:.2f}m)')
+    ax_success.set_xlabel('Maximum Position Reached (m)')
+    ax_success.set_ylabel('Probability Density')
+    ax_success.set_title('Distribution of Maximum Positions')
+    ax_success.legend()
+    ax_success.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    return fig
+
+def run_simulation_analysis():
+    """Main function to run simulation and analysis"""
+    print("=== Assisted Pull-up Machine SDE Simulation ===\n")
+    
+    # Initialize model with default parameters
+    params = SDEParameters()
+    sde_model = AssistedPullupSDE(params)
+    
+    # Initial conditions
+    X0 = np.array([
+        0.05,    # Starting at bottom position (m)
+        0.0,     # Zero initial velocity (m/s)
+        200.0,   # Initial user force (N)
+        30.0     # Nominal counterweight mass (kg)
+    ])
+    
+    # Simulation parameters
+    T = 10.0          # Total simulation time (s)
+    dt = 0.01         # Time step (s)
+    n_trajectories = 50  # Number of Monte Carlo trajectories
+    
+    print(f"Running Monte Carlo simulation:")
+    print(f"  - {n_trajectories} trajectories")
+    print(f"  - Total time: {T} seconds")
+    print(f"  - Time step: {dt} seconds")
+    print(f"  - Integration method: Euler-Maruyama\n")
+    
+    # Run simulation
+    np.random.seed(42)  # For reproducibility
+    t_array, trajectories = sde_model.monte_carlo_simulation(
+        X0, T, dt, n_trajectories, method='euler'
+    )
+    
+    # Calculate success probability
+    success_prob = sde_model.success_probability(trajectories)
+    
+    print(f"\n=== Simulation Results ===")
+    print(f"Success probability (reaching top): {success_prob:.2%}")
+    
+    # Statistical analysis
+    traj_array = np.array(trajectories)
+    final_positions = traj_array[:, -1, 0]
+    final_forces = traj_array[:, -1, 2]
+    
+    print(f"Final position statistics:")
+    print(f"  - Mean: {np.mean(final_positions):.3f} m")
+    print(f"  - Std: {np.std(final_positions):.3f} m")
+    print(f"  - Range: [{np.min(final_positions):.3f}, {np.max(final_positions):.3f}] m")
+    
+    print(f"Final force statistics:")
+    print(f"  - Mean: {np.mean(final_forces):.1f} N")
+    print(f"  - Std: {np.std(final_forces):.1f} N")
+    
+    # Create visualizations
+    fig = create_visualizations(sde_model, t_array, trajectories)
+    plt.show()
+    
+    return sde_model, t_array, trajectories
+
+if __name__ == "__main__":
+    # Run the complete analysis
+    model, time_array, trajectory_data = run_simulation_analysis()
