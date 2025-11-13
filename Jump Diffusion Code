@@ -1,0 +1,585 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from scipy import stats
+import pandas as pd
+from dataclasses import dataclass
+from typing import Tuple, List, Optional
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set style for better plots
+plt.style.use('default')
+plt.rcParams['figure.figsize'] = (12, 8)
+plt.rcParams['font.size'] = 10
+
+@dataclass
+class ExerciseParameters:
+    """Parameters for the exercise machine SDE model"""
+    # Physical parameters
+    m_b: float = 75.0          # User body mass (kg)
+    g: float = 9.81            # Gravity (m/s^2)
+    b: float = 50.0            # Damping coefficient (N⋅s/m)
+    F_max: float = 800.0       # Maximum user force (N)
+
+    # Position constraints
+    x_min: float = 0.0         # Minimum position (m)
+    x_max: float = 0.6         # Maximum position (m)
+    x_bottom: float = 0.0      # Bottom position (m)
+    x_top: float = 0.6         # Top position (m)
+
+    # Counterweight parameters
+    m_c_nominal: float = 50.0  # Nominal counterweight (kg)
+    m_c_max: float = 100.0     # Maximum counterweight (kg)
+    lambda_c: float = 2.0      # Counterweight restoration rate
+
+    # Force generation parameters
+    gamma_f: float = 0.5       # Force decay rate
+    alpha_f: float = 2.0       # Force generation rate
+    F_concentric: float = 600.0  # Target concentric force (N)
+    F_eccentric: float = 400.0   # Target eccentric force (N)
+    kappa_c: float = 0.8       # Concentric force-velocity coefficient
+    kappa_e: float = 0.6       # Eccentric force-velocity coefficient
+
+    # Stochastic parameters
+    sigma_v0: float = 0.1      # Baseline velocity noise
+    sigma_f0: float = 50.0     # Baseline force noise
+    sigma_c: float = 2.0       # Counterweight noise
+    epsilon_v: float = 0.3     # Velocity noise modulation
+    eta_f: float = 0.5         # Initial force variability
+    tau_f: float = 5.0         # Force stabilization time
+    omega_m: float = 0.5       # Movement frequency (rad/s)
+
+    # Jump parameters
+    lambda_0_mc: float = 0.2   # Base counterweight jump rate
+    alpha_mc: float = 2.0      # Force-dependent jump intensity
+    delta_m1: float = 10.0     # Counterweight increase (kg)
+    delta_m2: float = 15.0     # Counterweight decrease (kg)
+
+    lambda_0_F: float = 0.15   # Base force jump rate
+    beta_F: float = 3.0        # Adaptation factor for force jumps
+    tau_adaptation: float = 8.0  # Adaptation time constant
+    F_jump: float = 200.0      # Force jump magnitude (N)
+    F_threshold: float = 100.0 # Minimum force for jumps
+    v_0: float = 0.1          # Velocity threshold for jumps
+    k_vel: float = 10.0       # Velocity sensitivity parameter
+
+    # Failure jump parameters
+    lambda_failure: float = 0.05  # Failure jump rate
+    eta_drag: float = 0.5      # Drag increase on failure
+    gamma_failure: float = 0.3 # Force reduction on failure
+    xi_failure: float = 0.8    # Counterweight adjustment on failure
+    m_c_safe: float = 30.0     # Safe counterweight level
+
+class JumpDiffusionSimulator:
+    """Jump-diffusion simulator for exercise machine dynamics"""
+
+    def __init__(self, params: ExerciseParameters):
+        self.params = params
+        self.reset_simulation()
+
+    def reset_simulation(self):
+        """Reset simulation state"""
+        self.t = 0.0
+        self.trajectory = []
+        self.jump_times = []
+        self.jump_types = []
+        self.jump_magnitudes = []
+
+    def smooth_step(self, x: float, x0: float, width: float = 0.05) -> float:
+        """Smooth step function for continuous force transitions"""
+        return 0.5 * (1 + np.tanh((x - x0) / width))
+
+    def compute_target_force(self, x: float, phase: str = 'auto') -> float:
+        """Compute target force based on movement phase"""
+        if phase == 'auto':
+            # Automatically determine phase based on position
+            if x < self.params.x_top / 2:
+                phase = 'concentric'
+            else:
+                phase = 'eccentric'
+
+        if phase == 'concentric':
+            h = self.smooth_step(x, self.params.x_bottom)
+            return self.params.F_concentric * h
+        else:  # eccentric
+            h = 1 - self.smooth_step(x, self.params.x_top)
+            return self.params.F_eccentric * h
+
+    def compute_drift(self, X: np.ndarray, t: float) -> np.ndarray:
+        """Compute drift vector for the SDE"""
+        x, x_dot, F_u, m_c = X
+
+        # Target force based on position
+        F_target = self.compute_target_force(x)
+
+        # Force-velocity relationship
+        if x_dot >= 0:  # Concentric
+            beta_f = -self.params.kappa_c * x_dot
+        else:  # Eccentric
+            beta_f = -self.params.kappa_e * x_dot
+
+        # Assistance force
+        F_assist = m_c * self.params.g
+
+        # Drag force
+        F_drag = self.params.b * x_dot
+
+        # Drift components
+        drift = np.array([
+            x_dot,
+            (F_u + F_assist - self.params.m_b * self.params.g - F_drag) / self.params.m_b,
+            -self.params.gamma_f * F_u + self.params.alpha_f * F_target + beta_f,
+            -self.params.lambda_c * (m_c - self.params.m_c_nominal)
+        ])
+
+        return drift
+
+    def compute_diffusion(self, X: np.ndarray, t: float) -> np.ndarray:
+        """Compute diffusion matrix for the SDE"""
+        x, x_dot, F_u, m_c = X
+
+        # Velocity noise (phase-dependent)
+        sigma_v = self.params.sigma_v0 * np.sqrt(1 + self.params.epsilon_v *
+                                                np.cos(self.params.omega_m * t)**2)
+
+        # Force noise (force and time dependent)
+        sigma_f = self.params.sigma_f0 * np.sqrt(
+            max(F_u, 0) / self.params.F_max +
+            self.params.eta_f * np.exp(-t / self.params.tau_f)
+        )
+
+        # Diffusion matrix (diagonal)
+        diffusion = np.array([
+            [0, 0, 0],
+            [sigma_v, 0, 0],
+            [0, sigma_f, 0],
+            [0, 0, self.params.sigma_c]
+        ])
+
+        return diffusion
+
+    def compute_jump_intensities(self, X: np.ndarray, t: float) -> dict:
+        """Compute jump intensities for different jump types"""
+        x, x_dot, F_u, m_c = X
+
+        # Counterweight jump intensity
+        F_target = self.compute_target_force(x)
+        force_error = (F_u - F_target) / self.params.F_max
+        lambda_mc = self.params.lambda_0_mc * np.exp(self.params.alpha_mc * abs(force_error))
+
+        # Force jump intensity
+        adaptation_factor = 1 + self.params.beta_F * np.exp(-t / self.params.tau_adaptation)
+        velocity_factor = 1 / (1 + np.exp(-self.params.k_vel * (abs(x_dot) - self.params.v_0)))
+        lambda_F = self.params.lambda_0_F * adaptation_factor * velocity_factor
+
+        # Equipment failure intensity (constant)
+        lambda_failure = self.params.lambda_failure
+
+        return {
+            'counterweight': lambda_mc,
+            'force': lambda_F,
+            'failure': lambda_failure
+        }
+
+    def generate_jump(self, X: np.ndarray, jump_type: str, t: float) -> Tuple[np.ndarray, float]:
+        """Generate jump amplitude for given jump type"""
+        x, x_dot, F_u, m_c = X
+        jump_vector = np.zeros(4)
+        magnitude = 0.0
+
+        if jump_type == 'counterweight':
+            # Random choice between increase/decrease
+            if np.random.random() < 0.6:  # 60% chance of increase (user getting tired)
+                jump_vector[3] = self.params.delta_m1
+                magnitude = self.params.delta_m1
+            else:
+                jump_vector[3] = -self.params.delta_m2
+                magnitude = -self.params.delta_m2
+
+        elif jump_type == 'force':
+            # Force jump with random sign, only if above threshold
+            if F_u > self.params.F_threshold:
+                sign = 1 if np.random.random() < 0.3 else -1  # 30% positive, 70% negative
+                jump_vector[2] = self.params.F_jump * sign
+                magnitude = self.params.F_jump * sign
+
+        elif jump_type == 'failure':
+            # Equipment failure affects multiple components
+            jump_vector[1] = -self.params.eta_drag * x_dot  # Increased drag
+            jump_vector[2] = -self.params.gamma_failure * F_u  # Force reduction
+            jump_vector[3] = -self.params.xi_failure * (m_c - self.params.m_c_safe)  # Safety adjustment
+            magnitude = np.linalg.norm(jump_vector)
+
+        return jump_vector, magnitude
+
+    def apply_boundary_conditions(self, X: np.ndarray) -> np.ndarray:
+        """Apply reflecting boundary conditions"""
+        x, x_dot, F_u, m_c = X
+
+        # Position boundaries
+        if x <= self.params.x_min:
+            x = self.params.x_min
+            x_dot = max(0, x_dot)  # Only allow upward movement
+        elif x >= self.params.x_max:
+            x = self.params.x_max
+            x_dot = min(0, x_dot)  # Only allow downward movement
+
+        # Force positivity
+        F_u = max(0, F_u)
+
+        # Counterweight bounds
+        m_c = np.clip(m_c, 0, self.params.m_c_max)
+
+        return np.array([x, x_dot, F_u, m_c])
+
+    def simulate_trajectory(self, T: float, dt: float, X0: Optional[np.ndarray] = None) -> dict:
+        """Simulate a single trajectory using jump-adapted Euler-Maruyama"""
+        if X0 is None:
+            X0 = np.array([0.0, 0.0, 200.0, self.params.m_c_nominal])
+
+        # Initialize
+        self.reset_simulation()
+        n_steps = int(T / dt)
+        times = np.linspace(0, T, n_steps + 1)
+        trajectory = np.zeros((n_steps + 1, 4))
+        trajectory[0] = X0
+
+        X = X0.copy()
+        jump_info = {
+            'times': [],
+            'types': [],
+            'magnitudes': [],
+            'states_before': [],
+            'states_after': []
+        }
+
+        for i in range(n_steps):
+            t = times[i]
+
+            # Compute drift and diffusion
+            drift = self.compute_drift(X, t)
+            diffusion = self.compute_diffusion(X, t)
+
+            # Generate Brownian increments
+            dW = np.random.normal(0, np.sqrt(dt), 3)
+
+            # Standard SDE update
+            X_new = X + drift * dt + diffusion @ dW
+
+            # Check for jumps
+            intensities = self.compute_jump_intensities(X, t)
+
+            for jump_type, intensity in intensities.items():
+                # Poisson process: probability of jump in [t, t+dt]
+                prob_jump = 1 - np.exp(-intensity * dt)
+
+                if np.random.random() < prob_jump:
+                    # Record state before jump
+                    state_before = X_new.copy()
+
+                    # Generate and apply jump
+                    jump_vector, magnitude = self.generate_jump(X_new, jump_type, t)
+                    X_new += jump_vector
+
+                    # Record jump information
+                    jump_info['times'].append(t)
+                    jump_info['types'].append(jump_type)
+                    jump_info['magnitudes'].append(magnitude)
+                    jump_info['states_before'].append(state_before)
+                    jump_info['states_after'].append(X_new.copy())
+
+            # Apply boundary conditions
+            X_new = self.apply_boundary_conditions(X_new)
+
+            # Store trajectory
+            trajectory[i + 1] = X_new
+            X = X_new
+
+        return {
+            'times': times,
+            'trajectory': trajectory,
+            'jumps': jump_info,
+            'success': trajectory[-1, 0] >= 0.9 * self.params.x_top
+        }
+
+def run_monte_carlo_simulation(n_trajectories: int = 100, T: float = 20.0, dt: float = 0.01) -> dict:
+    """Run Monte Carlo simulation with multiple trajectories"""
+    params = ExerciseParameters()
+    simulator = JumpDiffusionSimulator(params)
+
+    results = {
+        'trajectories': [],
+        'success_rate': 0,
+        'jump_statistics': {
+            'counterweight': [],
+            'force': [],
+            'failure': []
+        },
+        'final_states': []
+    }
+
+    print(f"Running Monte Carlo simulation with {n_trajectories} trajectories...")
+
+    successes = 0
+
+    for i in range(n_trajectories):
+        if (i + 1) % (n_trajectories // 10) == 0:
+            print(f"Completed {i + 1}/{n_trajectories} trajectories")
+
+        # Random initial conditions
+        X0 = np.array([
+            0.0,  # Start at bottom
+            0.0,  # Zero initial velocity
+            np.random.normal(250, 50),  # Random initial force
+            params.m_c_nominal + np.random.normal(0, 5)  # Slightly random counterweight
+        ])
+
+        result = simulator.simulate_trajectory(T, dt, X0)
+        results['trajectories'].append(result)
+        results['final_states'].append(result['trajectory'][-1])
+
+        if result['success']:
+            successes += 1
+
+        # Collect jump statistics
+        for jump_type in result['jumps']['types']:
+            results['jump_statistics'][jump_type].append(1)
+
+    results['success_rate'] = successes / n_trajectories
+
+    # Convert jump counts to rates
+    for jump_type in results['jump_statistics']:
+        results['jump_statistics'][jump_type] = len(results['jump_statistics'][jump_type]) / n_trajectories / T
+
+    return results
+
+def plot_simulation_results(results: dict, show_individual: bool = True, max_trajectories: int = 20):
+    """Create comprehensive visualization of simulation results"""
+
+    # Create figure with subplots
+    fig = plt.figure(figsize=(16, 12))
+
+    # Plot 1: Sample trajectories - Position
+    ax1 = plt.subplot(3, 3, 1)
+    times = results['trajectories'][0]['times']
+
+    n_plot = min(max_trajectories, len(results['trajectories']))
+    for i in range(n_plot):
+        traj = results['trajectories'][i]['trajectory']
+        alpha = 0.3 if show_individual else 0.1
+        plt.plot(times, traj[:, 0], 'b-', alpha=alpha, linewidth=0.8)
+
+    # Plot mean trajectory
+    all_positions = np.array([traj['trajectory'][:, 0] for traj in results['trajectories']])
+    mean_position = np.mean(all_positions, axis=0)
+    std_position = np.std(all_positions, axis=0)
+
+    plt.plot(times, mean_position, 'r-', linewidth=2, label='Mean')
+    plt.fill_between(times, mean_position - std_position, mean_position + std_position,
+                     alpha=0.2, color='red', label='±1σ')
+
+    plt.axhline(y=0.6, color='g', linestyle='--', alpha=0.7, label='Target')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Position (m)')
+    plt.title('Position Trajectories')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # Plot 2: Sample trajectories - Force
+    ax2 = plt.subplot(3, 3, 2)
+    for i in range(n_plot):
+        traj = results['trajectories'][i]['trajectory']
+        plt.plot(times, traj[:, 2], 'g-', alpha=0.3, linewidth=0.8)
+
+    all_forces = np.array([traj['trajectory'][:, 2] for traj in results['trajectories']])
+    mean_force = np.mean(all_forces, axis=0)
+    plt.plot(times, mean_force, 'darkgreen', linewidth=2, label='Mean Force')
+
+    plt.xlabel('Time (s)')
+    plt.ylabel('Force (N)')
+    plt.title('User Force Trajectories')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # Plot 3: Counterweight trajectories
+    ax3 = plt.subplot(3, 3, 3)
+    for i in range(n_plot):
+        traj = results['trajectories'][i]['trajectory']
+        plt.plot(times, traj[:, 3], 'm-', alpha=0.3, linewidth=0.8)
+
+    all_counterweights = np.array([traj['trajectory'][:, 3] for traj in results['trajectories']])
+    mean_counterweight = np.mean(all_counterweights, axis=0)
+    plt.plot(times, mean_counterweight, 'darkmagenta', linewidth=2, label='Mean Counterweight')
+
+    plt.axhline(y=50, color='k', linestyle='--', alpha=0.5, label='Nominal')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Counterweight (kg)')
+    plt.title('Counterweight Trajectories')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # Plot 4: Jump events timeline
+    ax4 = plt.subplot(3, 3, 4)
+    jump_colors = {'counterweight': 'blue', 'force': 'red', 'failure': 'orange'}
+
+    for i, result in enumerate(results['trajectories'][:10]):  # Show first 10 trajectories
+        for j, (jump_time, jump_type) in enumerate(zip(result['jumps']['times'], result['jumps']['types'])):
+            plt.scatter(jump_time, i, c=jump_colors[jump_type], s=30, alpha=0.7)
+
+    plt.xlabel('Time (s)')
+    plt.ylabel('Trajectory Index')
+    plt.title('Jump Events Timeline')
+
+    # Create legend for jump types
+    for jump_type, color in jump_colors.items():
+        plt.scatter([], [], c=color, label=jump_type, s=30)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # Plot 5: Jump magnitude distributions
+    ax5 = plt.subplot(3, 3, 5)
+
+    all_magnitudes = {'counterweight': [], 'force': [], 'failure': []}
+    for result in results['trajectories']:
+        for jump_type, magnitude in zip(result['jumps']['types'], result['jumps']['magnitudes']):
+            all_magnitudes[jump_type].append(magnitude)
+
+    positions = [1, 2, 3]
+    labels = ['Counterweight', 'Force', 'Failure']
+    box_data = [all_magnitudes['counterweight'], all_magnitudes['force'], all_magnitudes['failure']]
+
+    plt.boxplot(box_data, positions=positions, labels=labels)
+    plt.ylabel('Jump Magnitude')
+    plt.title('Jump Magnitude Distributions')
+    plt.xticks(rotation=45)
+    plt.grid(True, alpha=0.3)
+
+    # Plot 6: Success rate and statistics
+    ax6 = plt.subplot(3, 3, 6)
+
+    # Bar plot of success rate
+    plt.bar(['Success Rate'], [results['success_rate']], color='green', alpha=0.7)
+    plt.ylabel('Probability')
+    plt.title(f'Success Rate: {results["success_rate"]:.2%}')
+    plt.ylim(0, 1)
+
+    for i, v in enumerate([results['success_rate']]):
+        plt.text(i, v + 0.02, f'{v:.2%}', ha='center', fontweight='bold')
+
+    plt.grid(True, alpha=0.3)
+
+    # Plot 7: Final state distributions
+    ax7 = plt.subplot(3, 3, 7)
+    final_positions = [state[0] for state in results['final_states']]
+
+    plt.hist(final_positions, bins=30, alpha=0.7, color='skyblue', edgecolor='black')
+    plt.axvline(x=0.6, color='red', linestyle='--', label='Target Position')
+    plt.xlabel('Final Position (m)')
+    plt.ylabel('Frequency')
+    plt.title('Final Position Distribution')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # Plot 8: Phase space plot (Position vs Velocity)
+    ax8 = plt.subplot(3, 3, 8)
+
+    for i in range(min(5, len(results['trajectories']))):
+        traj = results['trajectories'][i]['trajectory']
+        plt.plot(traj[:, 0], traj[:, 1], alpha=0.6, linewidth=1)
+        plt.scatter(traj[0, 0], traj[0, 1], marker='o', s=30, c='green', alpha=0.8)
+        plt.scatter(traj[-1, 0], traj[-1, 1], marker='s', s=30, c='red', alpha=0.8)
+
+    plt.xlabel('Position (m)')
+    plt.ylabel('Velocity (m/s)')
+    plt.title('Phase Space Plot')
+    plt.grid(True, alpha=0.3)
+
+    # Plot 9: Jump rate statistics
+    ax9 = plt.subplot(3, 3, 9)
+
+    jump_types = list(results['jump_statistics'].keys())
+    jump_rates = [results['jump_statistics'][jt] for jt in jump_types]
+
+    bars = plt.bar(jump_types, jump_rates, color=['blue', 'red', 'orange'], alpha=0.7)
+    plt.ylabel('Jump Rate (jumps/second)')
+    plt.title('Average Jump Rates')
+    plt.xticks(rotation=45)
+
+    # Add value labels on bars
+    for bar, rate in zip(bars, jump_rates):
+        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.001,
+                f'{rate:.3f}', ha='center', va='bottom', fontweight='bold')
+
+    plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+    # Print summary statistics
+    print(f"\n=== Simulation Summary ===")
+    print(f"Number of trajectories: {len(results['trajectories'])}")
+    print(f"Success rate: {results['success_rate']:.2%}")
+    print(f"Mean final position: {np.mean([s[0] for s in results['final_states']]):.3f} m")
+    print(f"Std final position: {np.std([s[0] for s in results['final_states']]):.3f} m")
+    print(f"\nJump rates (per second):")
+    for jump_type, rate in results['jump_statistics'].items():
+        print(f"  {jump_type}: {rate:.4f}")
+
+# Example usage and demonstration
+if __name__ == "__main__":
+    print("=== Jump-Diffusion Exercise Machine Simulation ===\n")
+
+    # Run Monte Carlo simulation
+    results = run_monte_carlo_simulation(n_trajectories=50, T=15.0, dt=0.01)
+
+    # Plot results
+    plot_simulation_results(results, show_individual=True, max_trajectories=15)
+
+    # Demonstrate single trajectory analysis
+    print("\n=== Single Trajectory Analysis ===")
+    params = ExerciseParameters()
+    simulator = JumpDiffusionSimulator(params)
+
+    # Simulate one detailed trajectory
+    single_result = simulator.simulate_trajectory(T=15.0, dt=0.01)
+
+    print(f"Trajectory success: {single_result['success']}")
+    print(f"Number of jumps: {len(single_result['jumps']['times'])}")
+    print(f"Jump types: {single_result['jumps']['types']}")
+    print(f"Final position: {single_result['trajectory'][-1, 0]:.3f} m")
+    print(f"Final force: {single_result['trajectory'][-1, 2]:.1f} N")
+
+    # Parameter sensitivity analysis
+    print("\n=== Parameter Sensitivity Analysis ===")
+
+    # Test different counterweight settings
+    counterweight_values = [30, 40, 50, 60, 70]
+    success_rates = []
+
+    for m_c in counterweight_values:
+        params_test = ExerciseParameters()
+        params_test.m_c_nominal = m_c
+        sim_test = JumpDiffusionSimulator(params_test)
+
+        # Run quick simulation
+        successes = 0
+        for _ in range(20):
+            result = sim_test.simulate_trajectory(T=15.0, dt=0.02)
+            if result['success']:
+                successes += 1
+
+        success_rates.append(successes / 20)
+
+    # Plot sensitivity
+    plt.figure(figsize=(10, 6))
+    plt.plot(counterweight_values, success_rates, 'o-', linewidth=2, markersize=8)
+    plt.xlabel('Counterweight Mass (kg)')
+    plt.ylabel('SR')
+    plt.title('Success Rate vs Counterweight Setting')
+    plt.grid(True, alpha=0.3)
+    plt.show()
+
+    print("Counterweight sensitivity analysis:")
+    for m_c, rate in zip(counterweight_values, success_rates):
+        print(f"  {m_c} kg: {rate:.2%} success rate")
