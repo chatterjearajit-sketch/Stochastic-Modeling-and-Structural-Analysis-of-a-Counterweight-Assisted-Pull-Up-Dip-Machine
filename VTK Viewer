@@ -1,0 +1,240 @@
+# PyVista VTK Viewer for Google Colab - FIXED VERSION
+
+!pip install pyvista
+import pyvista as pv
+import numpy as np
+from IPython.display import Image, display
+import matplotlib.pyplot as plt
+
+# Configure PyVista for Colab
+pv.set_jupyter_backend('static')  # Use static images instead of interactive
+pv.global_theme.window_size = [1024, 768]
+pv.global_theme.anti_aliasing = 'ssaa'  # Use 'ssaa', 'msaa', 'fxaa', or None
+
+def view_vtk_in_colab(vtk_file_path):
+    """
+    View VTK file in Google Colab with multiple visualization methods
+    """
+    print(f"�� Loading VTK file: {vtk_file_path}")
+
+    try:
+        # Load the mesh
+        mesh = pv.read(vtk_file_path)
+        print(f"✅ Loaded successfully!")
+        print(f"   - Points: {mesh.n_points}")
+        print(f"   - Cells: {mesh.n_cells}")
+
+    except Exception as e:
+        print(f"❌ Error loading VTK: {e}")
+        return None
+
+    print("\n�� Creating visualizations...")
+
+    # Method 1: Basic mesh view
+    print("1️⃣ Basic mesh view")
+    plotter = pv.Plotter(off_screen=True, window_size=(800, 600))
+    plotter.add_mesh(mesh, show_edges=True, color='lightblue', opacity=0.8)
+    plotter.add_axes()
+    plotter.camera_position = 'iso'  # FIXED: was 'isometric'
+    img1 = plotter.screenshot(return_img=True)
+    plotter.close()
+
+    plt.figure(figsize=(10, 8))
+    plt.imshow(img1)
+    plt.axis('off')
+    plt.title('Basic Mesh View', fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+    # Method 2: Wireframe view
+    print("2️⃣ Wireframe view")
+    plotter = pv.Plotter(off_screen=True, window_size=(800, 600))
+    plotter.add_mesh(mesh, style='wireframe', color='darkblue', line_width=1)
+    plotter.add_axes()
+    plotter.camera_position = 'iso'  # FIXED: was 'isometric'
+    img2 = plotter.screenshot(return_img=True)
+    plotter.close()
+
+    plt.figure(figsize=(10, 8))
+    plt.imshow(img2)
+    plt.axis('off')
+    plt.title('Wireframe View', fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+    # Method 3: Cross-section view
+    print("3️⃣ Cross-section view")
+    try:
+        clipped = mesh.clip('z', origin=mesh.center)
+        if clipped.n_cells > 0:
+            plotter = pv.Plotter(off_screen=True, window_size=(800, 600))
+            plotter.add_mesh(clipped, show_edges=True, color='orange', opacity=0.9)
+            plotter.add_axes()
+            plotter.camera_position = 'iso'  # FIXED: was 'isometric'
+            img3 = plotter.screenshot(return_img=True)
+            plotter.close()
+
+            plt.figure(figsize=(10, 8))
+            plt.imshow(img3)
+            plt.axis('off')
+            plt.title('Cross-Section View', fontsize=14)
+            plt.tight_layout()
+            plt.show()
+        else:
+            print("   ⚠️ No cross-section available")
+    except Exception as e:
+        print(f"   ⚠️ Cross-section failed: {e}")
+
+    # Method 4: Quality analysis (if tetrahedral mesh)
+    print("4️⃣ Quality analysis")
+    try:
+        quality_mesh = mesh.compute_cell_quality()
+
+        plotter = pv.Plotter(off_screen=True, window_size=(800, 600))
+
+        # Try cross-section first
+        try:
+            quality_slice = quality_mesh.clip('z', origin=mesh.center)
+            if quality_slice.n_cells > 0:
+                plotter.add_mesh(quality_slice, scalars='CellQuality',
+                               show_edges=True, cmap='RdYlBu_r', clim=[0, 1])
+            else:
+                # Fallback to surface
+                surface = quality_mesh.extract_geometry()
+                plotter.add_mesh(surface, scalars='CellQuality',
+                               show_edges=True, cmap='RdYlBu_r', clim=[0, 1])
+        except:
+            # Last resort - just show the mesh
+            plotter.add_mesh(quality_mesh, scalars='CellQuality',
+                           cmap='RdYlBu_r', clim=[0, 1])
+
+        plotter.add_scalar_bar(title="Element Quality")
+        plotter.add_axes()
+        plotter.camera_position = 'iso'  # FIXED: was 'isometric'
+        img4 = plotter.screenshot(return_img=True)
+        plotter.close()
+
+        plt.figure(figsize=(10, 8))
+        plt.imshow(img4)
+        plt.axis('off')
+        plt.title('Element Quality Analysis', fontsize=14)
+        plt.tight_layout()
+        plt.show()
+
+        # Print quality statistics
+        if 'CellQuality' in quality_mesh.array_names:
+            qualities = quality_mesh['CellQuality']
+            print(f"   �� Quality Stats:")
+            print(f"      - Min: {np.min(qualities):.3f}")
+            print(f"      - Max: {np.max(qualities):.3f}")
+            print(f"      - Mean: {np.mean(qualities):.3f}")
+            print(f"      - Poor elements (<0.1): {np.sum(qualities < 0.1)}/{len(qualities)}")
+
+    except Exception as e:
+        print(f"   ⚠️ Quality analysis failed: {e}")
+
+    # Method 5: Multiple angles
+    print("5️⃣ Multiple viewing angles")
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+
+    angles = [
+        ('Front', 'xy'),
+        ('Right', 'yz'),
+        ('Top', 'xz'),
+        ('Isometric', 'iso')  # FIXED: was 'isometric'
+    ]
+
+    for i, (name, view) in enumerate(angles):
+        row, col = i // 2, i % 2
+
+        plotter = pv.Plotter(off_screen=True, window_size=(600, 600))
+        plotter.add_mesh(mesh, show_edges=True, color='steelblue', opacity=0.8)
+        plotter.add_axes()
+        plotter.camera_position = view
+        img = plotter.screenshot(return_img=True)
+        plotter.close()
+
+        axes[row, col].imshow(img)
+        axes[row, col].set_title(f'{name} View', fontsize=12)
+        axes[row, col].axis('off')
+
+    plt.suptitle('Multiple Viewing Angles', fontsize=16)
+    plt.tight_layout()
+    plt.show()
+
+    return mesh
+
+def simple_vtk_view(vtk_file_path):
+    """
+    Simple one-liner VTK viewer for Colab
+    """
+    mesh = pv.read(vtk_file_path)
+
+    # Create a simple plot
+    plotter = pv.Plotter(off_screen=True, window_size=(800, 600))
+    plotter.add_mesh(mesh, show_edges=True, color='lightblue')
+    plotter.add_axes()
+    plotter.camera_position = 'iso'  # FIXED: was 'isometric'
+
+    # Get screenshot and display
+    img = plotter.screenshot(return_img=True)
+    plotter.close()
+
+    plt.figure(figsize=(12, 9))
+    plt.imshow(img)
+    plt.axis('off')
+    plt.title('VTK Mesh Visualization')
+    plt.show()
+
+    print(f"Mesh info: {mesh.n_points} points, {mesh.n_cells} cells")
+    return mesh
+
+def debug_camera_positions():
+    """
+    Helper function to test all valid camera positions
+    """
+    print("�� Valid PyVista camera positions:")
+    valid_positions = ['xy', 'xz', 'yz', 'yx', 'zx', 'zy', 'iso']
+
+    for pos in valid_positions:
+        print(f"   ✓ '{pos}' - {get_camera_description(pos)}")
+
+    print("\n❌ Invalid positions to avoid:")
+    print("   ✗ 'isometric' (use 'iso' instead)")
+    print("   ✗ 'perspective' (not supported)")
+    print("   ✗ 'orthographic' (not supported)")
+
+def get_camera_description(position):
+    """
+    Get description of camera position
+    """
+    descriptions = {
+        'xy': 'Looking down Z-axis (top view)',
+        'xz': 'Looking along Y-axis (front view)',
+        'yz': 'Looking along X-axis (side view)',
+        'yx': 'Looking up Z-axis (bottom view)',
+        'zx': 'Looking along Y-axis (back view)',
+        'zy': 'Looking along X-axis (opposite side view)',
+        'iso': 'Isometric 3D view'
+    }
+    return descriptions.get(position, 'Unknown position')
+
+# Example usage for Colab:
+print("�� PyVista VTK Viewer for Google Colab - FIXED VERSION")
+print("="*60)
+print("✅ All camera position errors have been fixed!")
+print("✅ Changed 'isometric' → 'iso' throughout the code")
+print("="*60)
+print("Usage:")
+print("1. Upload your VTK file to Colab")
+print("2. Use: view_vtk_in_colab('your_file.vtk')")
+print("3. Or use: simple_vtk_view('your_file.vtk')")
+print("4. Run debug_camera_positions() to see all valid camera angles")
+print("="*60)
+
+# Show valid camera positions
+debug_camera_positions()
+
+
+mesh = view_vtk_in_colab('/content/workout_equipment_mesh.vtk')
+mesh = simple_vtk_view('/content/workout_equipment_mesh.vtv')
